@@ -1,0 +1,13 @@
+name: mail-lapp
+metadata:
+  template: mail-lapp@0.1.0
+
+infra:
+  provider: bicep
+  path: infra
+
+services:
+  logic-app:
+    project: src/logic-app
+    language: js
+    host: function

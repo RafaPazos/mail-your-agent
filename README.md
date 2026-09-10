@@ -1,0 +1,579 @@
+# Logic Mail Receiver
+
+An Azure Logic App Standard that receives email, forwards the question to an
+existing Microsoft Foundry prompt agent, and replies to the original sender.
+
+The Logic App owns all mail orchestration. The Foundry agent contains no mail
+logic, and the Outlook connector contains no answering logic.
+
+## Contents
+
+- [Status](#status)
+- [Architecture](#architecture)
+- [Subject Trigger Filter](#subject-trigger-filter)
+- [Existing Foundry Resources](#existing-foundry-resources)
+- [Repository Layout](#repository-layout)
+- [Prerequisites](#prerequisites)
+- [Configure the AZD Environment](#configure-the-azd-environment)
+- [Validate Locally](#validate-locally)
+- [Deploy](#deploy)
+- [Authorize Outlook](#authorize-outlook)
+- [End-to-End Verification](#end-to-end-verification)
+- [Tenant Policy Constraints](#tenant-policy-constraints)
+- [Troubleshooting](#troubleshooting)
+- [Maintenance](#maintenance)
+- [Create a Receiving Email Address](#create-a-receiving-email-address)
+- [Security Notes](#security-notes)
+
+## Status
+
+Deployed to the `dev` environment in Sweden Central. The host is running and
+the `mail-agent` workflow reports `Healthy`.
+
+| Item | State |
+| ------ | ------- |
+| Infrastructure provisioned | Done |
+| Workflow deployed | Done |
+| Host starts and workflow is discovered | Done |
+| Subject filter and loop protection | Done |
+| Outlook connection authorized | **Pending — manual step, see [Authorize Outlook](#authorize-outlook)** |
+| End-to-end mail test | Blocked on authorization |
+
+The workflow cannot trigger until the Outlook connection is authorized. Until
+then no mail is read and no reply is sent.
+
+## Architecture
+
+1. The Office 365 Outlook connector monitors the authorized work or school
+   account's Inbox for mail whose subject contains the configured trigger
+   phrase (`MAIL_TRIGGER_PHRASE` app setting).
+2. A stateful Logic Apps Standard workflow re-checks the subject and extracts
+   the subject and body.
+3. The workflow calls the existing Foundry project's OpenAI Responses API at
+   `{PROJECT_ENDPOINT}/openai/v1/responses`, passing the agent by
+   `agent_reference`.
+4. The Logic App's system-assigned managed identity authenticates to Foundry
+   using the `https://ai.azure.com` audience. No key or secret is involved.
+5. The workflow selects the response element of type `message`, and replies to
+   the original message through Office 365 Outlook.
+
+### Workflow Actions
+
+| Action | Type | Purpose |
+| -------- | ------ | --------- |
+| `When_a_new_email_arrives` | `ApiConnectionNotification` | Trigger, `/v3/Mail/OnNewEmail`, filtered by subject |
+| `Check_subject_prefix` | `If` | Re-checks the subject and blocks reply loops |
+| `Call_Foundry_agent` | `Http` | Calls the Responses API with managed identity |
+| `Filter_response_messages` | `Query` | Keeps only output items where `type` is `message` |
+| `Reply_to_email` | `ApiConnection` | `/v3/Mail/ReplyTo/{messageId}`, HTML-escaped answer |
+
+## Subject Trigger Filter
+
+The workflow only answers mail whose subject contains the configured trigger
+phrase, read from the `MAIL_TRIGGER_PHRASE` app setting (set via
+`azd env set MAIL_TRIGGER_PHRASE '<your phrase>'`, see
+[Configure the AZD Environment](#configure-the-azd-environment)). This is
+enforced at two independent layers.
+
+**Connector layer.** `subjectFilter` is set in the trigger's `fetch.queries`,
+so the connector never returns unrelated mail. It is deliberately absent from
+`subscribe.queries`: `GraphMailSubscriptionPoke` is a bare notification
+endpoint, and an unsupported query parameter there can break subscription
+registration.
+
+**Workflow layer.** The `Check_subject_prefix` condition re-evaluates the
+subject. It is intentionally case-insensitive, so it can never be stricter than
+the connector filter and silently drop legitimate mail.
+
+Trigger-level `conditions` are not used. With `splitOn` present they evaluate
+against the batch wrapper, where `triggerBody()?['subject']` does not resolve.
+
+### Loop Protection
+
+A reply keeps the original subject, prefixed with `RE:`. That subject still
+contains the trigger phrase, so if a reply ever lands back in the monitored
+Inbox it would retrigger the workflow and answer itself indefinitely.
+
+`Check_subject_prefix` therefore also requires that the subject does **not**
+start with `re:`:
+
+```json
+{
+  "and": [
+    {
+      "contains": [
+        "@toLower(coalesce(triggerBody()?['subject'], ''))",
+        "@toLower(appsetting('MAIL_TRIGGER_PHRASE'))"
+      ]
+    },
+    {
+      "not": {
+        "startsWith": [
+          "@toLower(trim(coalesce(triggerBody()?['subject'], '')))",
+          "re:"
+        ]
+      }
+    }
+  ]
+}
+```
+
+Send the first end-to-end test from a different mailbox than the monitored one.
+
+## Existing Foundry Resources
+
+This project does not create or modify a Foundry project, model, or agent.
+
+| Setting | Value |
+| --------- | ------- |
+| Project endpoint | `https://<foundry-resource-name>.services.ai.azure.com/api/projects/<foundry-project-name>` |
+| OpenAI resource endpoint | `https://<foundry-resource-name>.openai.azure.com/openai/v1` |
+| Prompt agent | `ms-expert` |
+| Token audience | `https://ai.azure.com` |
+| Foundry resource group | `<foundry-resource-group>` |
+| Role granted to the Logic App | `Foundry User` (`53ca6127-db72-4b80-b1b0-d745d6d5456d`) |
+
+The `ms-expert` prompt agent was invoked successfully during preparation. The
+initially selected `azure-helper` and `ms-expert-new` agents could not run: both
+raise `McpProtocolException` because an MCP tool endpoint configured on them
+cannot be resolved from the Foundry network path. That is pre-existing agent
+configuration, not a fault in this project.
+
+## Repository Layout
+
+```text
+.
+|-- .github/
+|   `-- copilot-instructions.md
+|-- .gitignore
+|-- .markdownlint-cli2.jsonc
+|-- azure.yaml
+|-- infra/
+|   |-- main.bicep
+|   |-- main.parameters.json
+|   `-- modules/
+|       |-- foundry-rbac.bicep
+|       `-- resources.bicep
+`-- src/
+    `-- logic-app/
+        |-- connections.json
+        |-- host.json
+        |-- package.json
+        |-- package-lock.json
+        `-- workflows/
+            `-- mail-agent/
+                `-- workflow.json
+```
+
+`src/logic-app/package.json` carries no dependencies. It exists only because
+`azure.yaml` declares the service language as `js`, which makes `azd` expect a
+manifest when packaging.
+
+`infra/main.bicep` is subscription-scoped: it creates the resource group and
+invokes `modules/resources.bicep`. `modules/foundry-rbac.bicep` exists as a
+separate module only because the Foundry account lives in a different resource
+group, which Bicep cannot target inline.
+
+Infrastructure and application settings are managed in Bicep. Logic Apps
+Standard workflow content is version-controlled under `src/logic-app` and is
+ZIP-deployed by `azd`. Portal edits must be exported back into this directory.
+
+## Prerequisites
+
+- Azure CLI with access to subscription
+  `<YOUR_SUBSCRIPTION_ID>`.
+- Azure Developer CLI (`azd`).
+- Node.js, used by `azd` to package the service and to validate JSON locally.
+- Permission to create resources and role assignments in:
+  - The deployment resource group.
+  - `<foundry-resource-group>`, for the Logic App's `Foundry User` assignment.
+- A Microsoft 365 work or school account for the receiving mailbox.
+
+### Region Selection
+
+The deployment region is **Sweden Central**. North Europe cannot be used: the
+subscription's WS1 quota there is zero. This surfaces only during ARM preflight
+validation as `InternalSubscriptionIsOverQuotaForSku`; the quota CLI returns no
+records for `Microsoft.Web`. West Europe also passes preflight, but Sweden
+Central was selected because it colocates the workflow with the existing
+Foundry resource.
+
+Deployment names cannot be reused across regions. Pass a unique `--name` when
+invoking `az deployment sub` directly, or `InvalidDeploymentLocation` is
+returned.
+
+## Configure the AZD Environment
+
+The local `dev` environment is already configured. To recreate it:
+
+```powershell
+$env:AZURE_DEV_USER_AGENT = 'microsoft_foundry_skill'
+azd env new dev --no-prompt
+azd env set AZURE_SUBSCRIPTION_ID <YOUR_SUBSCRIPTION_ID>
+azd env set AZURE_LOCATION swedencentral
+azd env set AZURE_AI_PROJECT_ENDPOINT 'https://<foundry-resource-name>.services.ai.azure.com/api/projects/<foundry-project-name>'
+azd env set FOUNDRY_AGENT_NAME ms-expert
+azd env set AZURE_FOUNDRY_RESOURCE_GROUP <foundry-resource-group>
+azd env set AZURE_FOUNDRY_RESOURCE_NAME <foundry-resource-name>
+azd env set MAIL_TRIGGER_PHRASE 'Ask the Agent:'
+```
+
+`MAIL_TRIGGER_PHRASE` is the subject-line phrase that triggers the workflow.
+It is read at runtime via `appsetting('MAIL_TRIGGER_PHRASE')`, so it can be
+changed with `azd env set` plus a redeploy of infrastructure — no workflow
+code change required.
+
+`.azure/` is gitignored because it contains developer-specific environment
+state.
+
+## Validate Locally
+
+Compile the complete Bicep deployment:
+
+```powershell
+az bicep build --file .\infra\main.bicep --stdout > $null
+```
+
+Validate all generated JSON, including the workflow definition:
+
+```powershell
+@(
+  '.\infra\main.parameters.json',
+  '.\src\logic-app\host.json',
+  '.\src\logic-app\connections.json',
+  '.\src\logic-app\workflows\mail-agent\workflow.json'
+) | ForEach-Object {
+  Get-Content -Raw $_ | ConvertFrom-Json > $null
+  Write-Host "OK $_"
+}
+```
+
+Both commands must succeed before deploying.
+
+Lint the documentation. Rules live in `.markdownlint-cli2.jsonc`:
+
+```powershell
+npx --yes markdownlint-cli2
+```
+
+## Deploy
+
+```powershell
+$env:AZURE_DEV_USER_AGENT = 'microsoft_foundry_skill'
+azd up
+```
+
+Use `azd provision` to apply infrastructure changes only, and `azd deploy` to
+push workflow changes only. `azd deploy` completes in well under a minute and
+is the fast path when editing `workflow.json`.
+
+> `azd deploy` reporting success does not prove the workflow was registered.
+> Always run the health check below afterwards.
+
+### Deployed Resources (`dev`)
+
+| Resource | Name |
+| ---------- | ------ |
+| Resource group | `<resource-group-name>` (Sweden Central) |
+| Logic App Standard | `<app-name>` |
+| App Service plan | `<app-service-plan-name>` (WS1) |
+| Storage account | `<storage-account-name>` |
+| Host storage identity | `<host-identity-name>` (user-assigned) |
+| Application Insights | `<app-insights-name>` |
+| Log Analytics workspace | `<log-analytics-name>` |
+| Outlook connection | `<connection-name>` (V2) |
+
+Endpoint: `https://<app-name>.azurewebsites.net`
+
+### Confirm the Host and Workflow
+
+```powershell
+$sub = '<YOUR_SUBSCRIPTION_ID>'
+$app = '<app-name>'
+
+Invoke-WebRequest "https://$app.azurewebsites.net/" -UseBasicParsing |
+  Select-Object StatusCode
+
+az rest --method get --url "https://management.azure.com/subscriptions/$sub/resourceGroups/<resource-group-name>/providers/Microsoft.Web/sites/$app/hostruntime/runtime/webhooks/workflow/api/management/workflows?api-version=2018-11-01" --query "[].{name:name,health:health.state,disabled:isDisabled}" -o table
+```
+
+The site must return `200`, and `mail-agent` must report `Healthy` with
+`disabled` false. Anything else is covered in
+[Troubleshooting](#troubleshooting).
+
+Note that the ARM `hostruntime/host/workflows` path returns `Not Found` for
+Logic Apps Standard. Use the `hostruntime/runtime/webhooks/workflow/...` path
+shown above.
+
+### Inspect the Deployed Package
+
+SCM basic authentication is disabled, so Kudu must be called with an Entra
+token rather than publishing credentials. This reads the workflow definition as
+actually deployed:
+
+```powershell
+$app = '<app-name>'
+$token = az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv
+Invoke-RestMethod `
+  -Uri "https://$app.scm.azurewebsites.net/api/vfs/site/wwwroot/workflows/mail-agent/workflow.json" `
+  -Headers @{ Authorization = "Bearer $token" } |
+  ConvertTo-Json -Depth 40
+```
+
+## Authorize Outlook
+
+Office 365 Outlook uses delegated OAuth. A managed identity cannot replace the
+mailbox-user sign-in, so this step is manual and must be repeated if the
+authorization is ever revoked.
+
+Managed identity covers only the Logic App to connection hop. That is
+configured through a `Microsoft.Web/connections/accessPolicies` child resource
+and `"authentication": { "type": "ManagedServiceIdentity" }` in
+`connections.json`.
+
+1. Open the `<connection-name>` API connection in the Azure portal.
+2. Select **Edit API connection**.
+3. Select **Authorize** and sign in with the receiving work or school account.
+4. Select **Save**.
+5. Confirm the connection status is no longer `Unauthenticated`:
+
+   ```powershell
+   az resource show -g <resource-group-name> -n <connection-name> `
+     --resource-type Microsoft.Web/connections `
+     --query "properties.statuses" -o json
+   ```
+
+6. Restart the Logic App once, then re-run the health check in
+   [Confirm the Host and Workflow](#confirm-the-host-and-workflow).
+
+### Why the Connection Is Keyless
+
+`listConnectionKeys` requires a `validityTimeSpan` argument, and Azure enforces
+a value greater than `01:00:00` and less than `31.00:00:00`. Any connection key
+would therefore expire within a month.
+
+The connection is instead created with `kind: 'V2'` and paired with an access
+policy granting the Logic App's managed identity. Two constraints follow:
+
+- V1 connections reject access policies with
+  `InvalidApiConnectionAccessPolicy`.
+- A connection's `kind` cannot be changed from V1 to V2 in place; the attempt
+  fails with `ConnectionV2KindMismatch`. The resource must be recreated under a
+  new name, which is why the connection is named `office365v2-*`.
+
+The access policy resource name must be computable before deployment starts, so
+it is derived with `guid(connection.id, logicApp.id)` rather than from
+`logicApp.identity.principalId`, which would raise `BCP120`.
+
+## End-to-End Verification
+
+1. From a **different** mailbox, send an email to the authorized mailbox with a
+   subject containing the configured trigger phrase (`MAIL_TRIGGER_PHRASE`)
+   followed by the question.
+2. Confirm a `mail-agent` workflow run starts.
+3. Confirm `Check_subject_prefix` evaluates to true and `Call_Foundry_agent`
+   succeeds.
+4. Confirm the sender receives a reply containing the `ms-expert` response.
+5. Send a second email **without** the phrase and confirm no run and no reply.
+6. Confirm the reply itself did not trigger a second run.
+7. Review any failures in Logic App run history and in Application Insights.
+
+## Tenant Policy Constraints
+
+Three tenant controls shape this design. Each one blocked the deployment before
+it was addressed, and each fix is captured in Bicep so it survives
+re-provisioning.
+
+### 1. Shared-Key Storage Authentication Is Disabled
+
+`MCAPSGovDeployPolicies` includes `StorageAccount_DisableLocalAuth_Modify`,
+which forces `allowSharedKeyAccess` to `false`. The Bicep templates therefore:
+
+- Set `allowSharedKeyAccess` to `false` explicitly and
+  `defaultToOAuthAuthentication` to `true`.
+- Configure `AzureWebJobsStorage` through account-name and managed-identity
+  settings rather than a connection string.
+- Omit `WEBSITECONTENTAZUREFILECONNECTIONSTRING` and `WEBSITECONTENTSHARE`.
+- Set `functionAppScaleLimit` to 20, as required by the documented
+  no-Azure-Files deployment pattern.
+- Grant blob, queue, and table data-plane roles to both identities.
+
+| Role | ID |
+| ------ | ----- |
+| Storage Blob Data Owner | `b7e6dc6d-f1e8-4753-8033-0f276bb0955b` |
+| Storage Queue Data Contributor | `974c5e8b-45b9-4653-ba55-5f855dd0fb88` |
+| Storage Table Data Contributor | `0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3` |
+
+### 2. Host Storage Requires a User-Assigned Identity
+
+The Logic Apps Standard runtime supports **only** a user-assigned managed
+identity for host storage. With a system-assigned identity the host refuses to
+start with:
+
+```text
+The authentication credential type for the storage account isn't valid.
+```
+
+The Logic Apps runtime and the Functions SDK use different setting
+conventions, so both are set:
+
+| Setting | Value | Consumer |
+| --------- | ------- | ---------- |
+| `AzureWebJobsStorage__accountName` | `<storage-account-name>` | Both |
+| `AzureWebJobsStorage__credentialType` | `managedIdentity` | Logic Apps runtime |
+| `AzureWebJobsStorage__managedIdentityResourceId` | Resource ID of `<host-identity-name>` | Logic Apps runtime |
+| `AzureWebJobsStorage__credential` | `managedidentity` | Functions SDK component factory |
+| `AzureWebJobsStorage__clientId` | Client ID of `<host-identity-name>` | Functions SDK component factory |
+| `AzureWebJobsStorage__blobServiceUri` | Blob endpoint | Both |
+| `AzureWebJobsStorage__queueServiceUri` | Queue endpoint | Both |
+| `AzureWebJobsStorage__tableServiceUri` | Table endpoint | Both |
+| `AzureWebJobsSecretStorageType` | `Files` | Functions host |
+
+`AzureWebJobsSecretStorageType` must be `Files`. The blob-backed secret
+repository still demands a storage connection string or SAS, which cannot exist
+while shared-key access is disabled, and fails with
+`Secret initialization from Blob storage failed`.
+
+`AzureWebJobsStorage__credential` and `AzureWebJobsStorage__clientId` are kept
+defensively for the Functions SDK component factory. Adding them alone did not
+resolve the startup failure; `Files` secret storage did. Removing them has not
+been tested.
+
+The Logic App keeps its system-assigned identity as well. Foundry access, the
+API connection access policy, and `connections.json` all resolve to it, so the
+site uses identity type `SystemAssigned, UserAssigned`.
+
+### 3. Storage Public Network Access Is Force-Disabled
+
+`MCAPSGovDeployPolicies` also includes a `modify` policy,
+`StorageAccount_PublicNetwork_Modify`, that sets `publicNetworkAccess` to
+`Disabled` with `bypass: None`. The Logic App host then cannot reach its own
+storage, every request returns `503 Function host is not running`, and
+Application Insights records `Unexpected HTTP status code 'Forbidden'`.
+
+The policy assignment is scoped above the subscription, so a policy exemption
+cannot be created here even with subscription Owner rights. The storage account
+therefore carries the documented `SecurityControl=Ignore` tag and sets
+`publicNetworkAccess` to `Enabled`. Both are declared in
+`infra/modules/resources.bicep`.
+
+### Policy Exemption Tag
+
+Do not apply this exemption preemptively. If an MCAPS policy blocks a required
+resource, the documented temporary resource-level exemption is:
+
+- Tag name: `SecurityControl`
+- Tag value: `Ignore`
+- Apply only to the affected resource or resource group.
+- Valid for 14 days, and available once per resource or resource group.
+
+Longer exclusions require the MCAPS Azure Policy Enforcement process. See
+[Maintenance](#maintenance) for what this means for this deployment.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| --------- | ------- | ----- |
+| `503 Function host is not running` | Storage `publicNetworkAccess` reverted to `Disabled` by policy | Re-apply the `SecurityControl=Ignore` tag, set `publicNetworkAccess` to `Enabled`, restart |
+| `403` on the site root | The app is stopped | `az webapp start`; `azd` has left the site stopped after interrupted operations |
+| `The authentication credential type for the storage account isn't valid` | Host storage is using the system-assigned identity | Use the user-assigned identity settings listed above |
+| `Secret initialization from Blob storage failed` | Blob secret repository needs a key or SAS | Set `AzureWebJobsSecretStorageType` to `Files` |
+| `Unexpected HTTP status code 'Forbidden'` at startup | Host cannot reach storage | Check `publicNetworkAccess`, then the data-plane role assignments |
+| `Encountered an error (Forbidden) from extensions API` | The host is not running | Resolve the underlying startup error first |
+| `InternalSubscriptionIsOverQuotaForSku` | WS1 quota is zero in the region | Deploy to Sweden Central |
+| `ConnectionV2KindMismatch` | A V1 connection already exists under that name | Recreate the connection under a new name |
+| `This connection is not authenticated` | Outlook OAuth consent is missing | See [Authorize Outlook](#authorize-outlook) |
+| Trigger never fires | Connection unauthorized, or the subject lacks the phrase | Check the connection status, then the subject |
+
+Read host startup failures from Application Insights:
+
+```powershell
+$appId = az monitor app-insights component show `
+  -g <resource-group-name> -a <app-insights-name> --query appId -o tsv
+
+az monitor app-insights query --app $appId --analytics-query `
+  "union traces,exceptions | where timestamp > ago(30m) | where severityLevel >= 2 | project timestamp, m=substring(coalesce(outerMessage,message),0,350) | order by timestamp desc | take 10" `
+  --query "tables[0].rows" -o json
+```
+
+## Maintenance
+
+**The `SecurityControl=Ignore` tag expires 14 days after it is applied.** When
+it does, `StorageAccount_PublicNetwork_Modify` will disable storage public
+network access again and the Logic App will stop working with no other warning
+than a `503`.
+
+| Event | Date |
+| --- | --- |
+| Tag applied to `<storage-account-name>` | 2026-09-09 |
+| Tag expires | **2026-09-23** |
+
+Before that date, either:
+
+- Request a permanent exclusion through the MCAPS Azure Policy Enforcement
+  process. **This is the chosen path for this deployment.**
+- Or move the Logic App onto VNet integration with private endpoints for blob,
+  queue, and table. This requires a subnet delegated to
+  `Microsoft.Web/serverFarms`, private DNS zones linked before the site is
+  wired to the subnet, and `WEBSITE_DNS_SERVER` set to `168.63.129.16`.
+
+Other recurring checks:
+
+- Re-run the health check after any `azd deploy`.
+- Confirm the Outlook connection is still authorized if the trigger stops
+  firing.
+- Reflect any portal edit of the workflow back into
+  `src/logic-app/workflows/mail-agent/workflow.json`.
+
+## Create a Receiving Email Address
+
+Choose one of the following, depending on how the mailbox will be used. All
+options are performed in the [Microsoft 365 Admin
+Center](https://admin.microsoft.com).
+
+Required roles, depending on the operation: Global Administrator, User
+Administrator, or Exchange Administrator.
+
+### Option 1: A Mailbox for a New User
+
+1. Navigate to **Users** > **Active users**.
+2. Select **Add a user**.
+3. Enter the name and username. The username becomes the email address, for
+   example `john@yourdomain.com`.
+4. Assign an Exchange Online license, such as Microsoft 365 E3, E5, or Business
+   Premium.
+5. Finish the wizard.
+
+The mailbox is created automatically once the license is assigned.
+
+### Option 2: A Shared Mailbox
+
+Use this for addresses owned by a team, such as `support@` or `info@`.
+
+1. Navigate to **Teams & Groups** > **Shared mailboxes**.
+2. Select **Add a shared mailbox**.
+3. Enter the display name and email address, for example
+   `support@yourdomain.com`.
+4. Save, then add the members who need access.
+
+### Option 3: An Alias on an Existing Mailbox
+
+Use this to deliver another address into a mailbox that already exists.
+
+1. Navigate to **Users** > **Active users**.
+2. Select the user.
+3. Select **Manage username and email**.
+4. Add an email alias.
+
+For example, with primary address `rafael@contoso.com` and alias
+`sales@contoso.com`, both addresses deliver to the same mailbox.
+
+## Security Notes
+
+- No storage keys, connection keys, or Foundry credentials are stored in source
+  control, in Bicep parameter files, or in app settings.
+- Storage access uses managed identity with data-plane RBAC only.
+- Foundry access uses the system-assigned managed identity with the
+  `Foundry User` role, scoped to the single Foundry account.
+- The only credential in the system is the delegated Outlook OAuth grant, which
+  is held by the API connection resource and never leaves Azure.

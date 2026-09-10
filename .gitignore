@@ -1,0 +1,6 @@
+.azure
+node_modules/
+local.settings.json
+*.env
+.env
+.env.*

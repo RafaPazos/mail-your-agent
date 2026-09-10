@@ -1,0 +1,138 @@
+{
+  "definition": {
+    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+    "contentVersion": "1.0.0.0",
+    "triggers": {
+      "When_a_new_email_arrives": {
+        "type": "ApiConnectionNotification",
+        "inputs": {
+          "host": {
+            "connection": {
+              "referenceName": "office365"
+            }
+          },
+          "fetch": {
+            "method": "get",
+            "pathTemplate": {
+              "template": "/v3/Mail/OnNewEmail"
+            },
+            "queries": {
+              "fetchOnlyWithAttachment": false,
+              "folderPath": "Inbox",
+              "importance": "Any",
+              "includeAttachments": false,
+              "subjectFilter": "@appsetting('MAIL_TRIGGER_PHRASE')"
+            }
+          },
+          "subscribe": {
+            "method": "post",
+            "pathTemplate": {
+              "template": "/GraphMailSubscriptionPoke/$subscriptions"
+            },
+            "body": {
+              "NotificationUrl": "@{listCallbackUrl()}"
+            },
+            "queries": {
+              "fetchOnlyWithAttachment": false,
+              "folderPath": "Inbox",
+              "importance": "Any"
+            }
+          }
+        },
+        "splitOn": "@triggerBody()?['value']"
+      }
+    },
+    "actions": {
+      "Check_subject_prefix": {
+        "type": "If",
+        "runAfter": {},
+        "expression": {
+          "and": [
+            {
+              "contains": [
+                "@toLower(coalesce(triggerBody()?['subject'], ''))",
+                "@toLower(appsetting('MAIL_TRIGGER_PHRASE'))"
+              ]
+            },
+            {
+              "not": {
+                "startsWith": [
+                  "@toLower(trim(coalesce(triggerBody()?['subject'], '')))",
+                  "re:"
+                ]
+              }
+            }
+          ]
+        },
+        "else": {
+          "actions": {}
+        },
+        "actions": {
+          "Call_Foundry_agent": {
+            "type": "Http",
+            "runAfter": {},
+            "inputs": {
+              "method": "POST",
+              "uri": "@concat(appsetting('FOUNDRY_PROJECT_ENDPOINT'), '/openai/v1/responses')",
+              "headers": {
+                "Content-Type": "application/json"
+              },
+              "authentication": {
+                "type": "ManagedServiceIdentity",
+                "audience": "https://ai.azure.com"
+              },
+              "body": {
+                "agent_reference": {
+                  "name": "@appsetting('FOUNDRY_AGENT_NAME')",
+                  "type": "agent_reference"
+                },
+                "input": "@concat('Subject: ', coalesce(triggerBody()?['subject'], '(no subject)'), decodeUriComponent('%0A%0A'), coalesce(triggerBody()?['body'], triggerBody()?['bodyPreview'], ''))"
+              }
+            },
+            "runtimeConfiguration": {
+              "contentTransfer": {
+                "transferMode": "Chunked"
+              }
+            }
+          },
+          "Filter_response_messages": {
+            "type": "Query",
+            "runAfter": {
+              "Call_Foundry_agent": [
+                "Succeeded"
+              ]
+            },
+            "inputs": {
+              "from": "@body('Call_Foundry_agent')?['output']",
+              "where": "@equals(item()?['type'], 'message')"
+            }
+          },
+          "Reply_to_email": {
+            "type": "ApiConnection",
+            "runAfter": {
+              "Filter_response_messages": [
+                "Succeeded"
+              ]
+            },
+            "inputs": {
+              "host": {
+                "connection": {
+                  "referenceName": "office365"
+                }
+              },
+              "method": "post",
+              "path": "/v3/Mail/ReplyTo/@{encodeURIComponent(triggerBody()?['id'])}",
+              "body": {
+                "Body": "@concat('<p>Answer from ', appsetting('FOUNDRY_AGENT_NAME'), ':</p><pre style=\"white-space:pre-wrap\">', replace(replace(replace(coalesce(first(body('Filter_response_messages'))?['content']?[0]?['text'], 'The agent returned no text response.'), '&', '&amp;'), '<', '&lt;'), '>', '&gt;'), '</pre>')",
+                "Importance": "Normal",
+                "ReplyAll": false
+              }
+            }
+          }
+        }
+      }
+    },
+    "outputs": {}
+  },
+  "kind": "Stateful"
+}
