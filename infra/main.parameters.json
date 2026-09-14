@@ -17,6 +17,9 @@
     "mailTriggerPhrase": {
       "value": "${MAIL_TRIGGER_PHRASE}"
     },
+    "contentUnderstandingEndpoint": {
+      "value": "${CONTENT_UNDERSTANDING_ENDPOINT}"
+    },
     "foundryResourceGroupName": {
       "value": "${AZURE_FOUNDRY_RESOURCE_GROUP}"
     },

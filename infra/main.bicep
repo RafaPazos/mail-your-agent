@@ -16,6 +16,9 @@ param foundryAgentName string
 @description('Subject-line phrase that triggers the workflow (case-insensitive).')
 param mailTriggerPhrase string
 
+@description('Existing Azure AI Content Understanding endpoint, used to extract text from PDF attachments.')
+param contentUnderstandingEndpoint string
+
 @description('Resource group of the existing Microsoft Foundry account.')
 param foundryResourceGroupName string
 
@@ -43,6 +46,7 @@ module resources './modules/resources.bicep' = {
     foundryProjectEndpoint: foundryProjectEndpoint
     foundryAgentName: foundryAgentName
     mailTriggerPhrase: mailTriggerPhrase
+    contentUnderstandingEndpoint: contentUnderstandingEndpoint
   }
 }
 

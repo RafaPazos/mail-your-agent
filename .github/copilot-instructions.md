@@ -16,14 +16,22 @@ A mail-triggered Azure Logic App Standard that proxies questions to a Microsoft
 Foundry prompt agent and replies to the original sender:
 
 1. The Office 365 Outlook connector watches an Inbox for subjects containing
-   the configured trigger phrase (`MAIL_TRIGGER_PHRASE` app setting).
+   the configured trigger phrase (`MAIL_TRIGGER_PHRASE` app setting), fetching
+   attachments with the trigger.
 2. The `mail-agent` workflow re-checks the subject and blocks `RE:` replies so
    the app cannot answer itself in a loop.
-3. It calls the existing Foundry project's Responses API at
-   `{PROJECT_ENDPOINT}/openai/v1/responses` using `agent_reference`.
-4. The Logic App's system-assigned managed identity authenticates with the
-   `https://ai.azure.com` audience.
-5. The agent's answer is sent back as a reply through Office 365 Outlook.
+3. If a PDF attachment (`contentType` is `application/pdf`) is present, its
+   bytes are sent to the existing Foundry resource's Content Understanding
+   endpoint's `prebuilt-documentSearch` analyzer (async `analyzeBinary` +
+   `Until`-loop polling of `Operation-Location`) to extract its text.
+   Non-PDF attachments are ignored.
+4. It calls the existing Foundry project's Responses API at
+   `{PROJECT_ENDPOINT}/openai/v1/responses` using `agent_reference`, with the
+   PDF's extracted text appended to the question if present.
+5. The Logic App's system-assigned managed identity authenticates with the
+   `https://ai.azure.com` audience for Foundry, and
+   `https://cognitiveservices.azure.com` for Content Understanding.
+6. The agent's answer is sent back as a reply through Office 365 Outlook.
 
 The Logic App is the orchestrator; the Foundry agent holds no mail logic, and the
 mail connector holds no answering logic. Keep that separation when adding code.

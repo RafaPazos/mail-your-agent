@@ -22,6 +22,9 @@ param foundryAgentName string
 @description('Subject-line phrase that triggers the workflow (case-insensitive).')
 param mailTriggerPhrase string
 
+@description('Existing Azure AI Content Understanding endpoint, used to extract text from PDF attachments.')
+param contentUnderstandingEndpoint string
+
 var suffix = take(uniqueString(subscription().id, resourceGroup().id, environmentName), 6)
 var storageAccountName = 'stmail${suffix}'
 var appServicePlanName = 'asp-${environmentName}-mail-${suffix}'
@@ -209,6 +212,10 @@ resource logicApp 'Microsoft.Web/sites@2023-12-01' = {
         {
           name: 'MAIL_TRIGGER_PHRASE'
           value: mailTriggerPhrase
+        }
+        {
+          name: 'CONTENT_UNDERSTANDING_ENDPOINT'
+          value: contentUnderstandingEndpoint
         }
         {
           name: 'FUNCTIONS_EXTENSION_VERSION'

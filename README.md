@@ -10,6 +10,7 @@ logic, and the Outlook connector contains no answering logic.
 
 - [Status](#status)
 - [Architecture](#architecture)
+- [PDF Attachment Support](#pdf-attachment-support)
 - [Subject Trigger Filter](#subject-trigger-filter)
 - [Existing Foundry Resources](#existing-foundry-resources)
 - [Repository Layout](#repository-layout)
@@ -29,26 +30,66 @@ logic, and the Outlook connector contains no answering logic.
 
 1. The Office 365 Outlook connector monitors the authorized work or school
    account's Inbox for mail whose subject contains the configured trigger
-   phrase (`MAIL_TRIGGER_PHRASE` app setting).
+   phrase (`MAIL_TRIGGER_PHRASE` app setting). Attachments are fetched with
+   the trigger (`includeAttachments: true`).
 2. A stateful Logic Apps Standard workflow re-checks the subject and extracts
    the subject and body.
-3. The workflow calls the existing Foundry project's OpenAI Responses API at
+3. If the mail has a PDF attachment (`contentType` is `application/pdf`; the
+   first one is used if there are several, any non-PDF attachments are
+   ignored), the workflow sends its bytes to the existing Azure AI Content
+   Understanding endpoint's `prebuilt-documentSearch` analyzer
+   (asynchronous `analyzeBinary` operation, polled via `Operation-Location`)
+   and extracts its text as markdown.
+4. The workflow calls the existing Foundry project's OpenAI Responses API at
    `{PROJECT_ENDPOINT}/openai/v1/responses`, passing the agent by
-   `agent_reference`.
-4. The Logic App's system-assigned managed identity authenticates to Foundry
-   using the `https://ai.azure.com` audience. No key or secret is involved.
-5. The workflow selects the response element of type `message`, and replies to
+   `agent_reference`. The question sent to the agent includes the subject,
+   body, and the PDF's extracted text, if any.
+5. The Logic App's system-assigned managed identity authenticates to both
+   Foundry (`https://ai.azure.com` audience) and Content Understanding
+   (`https://cognitiveservices.azure.com` audience). No key or secret is
+   involved.
+6. The workflow selects the response element of type `message`, and replies to
    the original message through Office 365 Outlook.
 
 ### Workflow Actions
 
 | Action | Type | Purpose |
 | -------- | ------ | --------- |
-| `When_a_new_email_arrives` | `ApiConnectionNotification` | Trigger, `/v3/Mail/OnNewEmail`, filtered by subject |
+| `When_a_new_email_arrives` | `ApiConnectionNotification` | Trigger, `/v3/Mail/OnNewEmail`, filtered by subject, with attachments |
+| `Initialize_pdf_extracted_text` | `InitializeVariable` | Holds the PDF's extracted text, empty if none |
 | `Check_subject_prefix` | `If` | Re-checks the subject and blocks reply loops |
+| `Filter_pdf_attachments` | `Query` | Keeps only attachments where `contentType` is `application/pdf` |
+| `Check_has_pdf_attachment` | `If` | Branches on whether a PDF attachment was found |
+| `Analyze_pdf_content` | `Http` | POSTs the first PDF's bytes to Content Understanding (`prebuilt-documentSearch`, async) |
+| `Until_pdf_analysis_complete` | `Until` | Polls the analysis operation every 2s, up to 1 minute |
+| `Delay_before_poll` | `Wait` | 2-second delay before each poll |
+| `Get_pdf_analysis_result` | `Http` | GETs the `Operation-Location` URL to check analysis status |
+| `Set_pdf_extracted_text` | `SetVariable` | Stores the analyzer's extracted markdown text, empty on failure/timeout |
 | `Call_Foundry_agent` | `Http` | Calls the Responses API with managed identity |
 | `Filter_response_messages` | `Query` | Keeps only output items where `type` is `message` |
 | `Reply_to_email` | `ApiConnection` | `/v3/Mail/ReplyTo/{messageId}`, HTML-escaped answer |
+
+## PDF Attachment Support
+
+Only PDF attachments (`contentType` is `application/pdf`) are processed. Any
+other attachment type is silently ignored, and the workflow proceeds as if no
+attachment were present — an email without a PDF, or with only non-PDF
+attachments, still gets answered from its subject and body alone.
+
+If more than one PDF is attached, only the first one (as returned by the
+Office 365 connector) is used; the others are ignored.
+
+PDF text extraction uses the [Content Understanding REST
+API](https://learn.microsoft.com/azure/ai-services/content-understanding/quickstart/use-async-rest-api)'s
+asynchronous `prebuilt-documentSearch:analyzeBinary` operation against the
+existing Foundry resource's Content Understanding endpoint
+(`CONTENT_UNDERSTANDING_ENDPOINT` app setting), using the GA API version
+`2025-11-01`. `prebuilt-documentSearch` is a RAG-optimized analyzer (markdown
+layout, semantic chunking, summaries) that only supports the async pattern:
+the workflow POSTs the PDF bytes, then an `Until` loop polls the
+`Operation-Location` URL every 2 seconds (up to 1 minute) until the status is
+`Succeeded` or `Failed`. If the analysis fails or times out, the extracted
+text is left empty and the agent still answers from the subject/body alone.
 
 ## Subject Trigger Filter
 
@@ -111,10 +152,12 @@ This project does not create or modify a Foundry project, model, or agent.
 | --------- | ------- |
 | Project endpoint | `https://<foundry-resource-name>.services.ai.azure.com/api/projects/<foundry-project-name>` |
 | OpenAI resource endpoint | `https://<foundry-resource-name>.openai.azure.com/openai/v1` |
+| Content Understanding endpoint | `https://<foundry-resource-name>.services.ai.azure.com` |
 | Prompt agent | `ms-expert` |
-| Token audience | `https://ai.azure.com` |
+| Token audience (Foundry) | `https://ai.azure.com` |
+| Token audience (Content Understanding) | `https://cognitiveservices.azure.com` |
 | Foundry resource group | `<foundry-resource-group>` |
-| Role granted to the Logic App | `Foundry User` (`53ca6127-db72-4b80-b1b0-d745d6d5456d`) |
+| Roles granted to the Logic App | `Foundry User` (`53ca6127-db72-4b80-b1b0-d745d6d5456d`), `Cognitive Services User` (`a97b65f3-24c7-4388-baec-2e87135dc908`) |
 
 The `ms-expert` prompt agent was invoked successfully during preparation. The
 initially selected `azure-helper` and `ms-expert-new` agents could not run: both
@@ -169,7 +212,8 @@ ZIP-deployed by `azd`. Portal edits must be exported back into this directory.
 - Node.js, used by `azd` to package the service and to validate JSON locally.
 - Permission to create resources and role assignments in:
   - The deployment resource group.
-  - `<foundry-resource-group>`, for the Logic App's `Foundry User` assignment.
+  - `<foundry-resource-group>`, for the Logic App's `Foundry User` and
+    `Cognitive Services User` assignments.
 - A Microsoft 365 work or school account for the receiving mailbox.
 
 ### Region Selection
@@ -199,6 +243,7 @@ azd env set FOUNDRY_AGENT_NAME ms-expert
 azd env set AZURE_FOUNDRY_RESOURCE_GROUP <foundry-resource-group>
 azd env set AZURE_FOUNDRY_RESOURCE_NAME <foundry-resource-name>
 azd env set MAIL_TRIGGER_PHRASE 'Ask the Agent:'
+azd env set CONTENT_UNDERSTANDING_ENDPOINT 'https://<foundry-resource-name>.services.ai.azure.com'
 ```
 
 `MAIL_TRIGGER_PHRASE` is the subject-line phrase that triggers the workflow.
@@ -359,7 +404,13 @@ it is derived with `guid(connection.id, logicApp.id)` rather than from
 4. Confirm the sender receives a reply containing the `ms-expert` response.
 5. Send a second email **without** the phrase and confirm no run and no reply.
 6. Confirm the reply itself did not trigger a second run.
-7. Review any failures in Logic App run history and in Application Insights.
+7. Send a third email, subject containing the trigger phrase, with a PDF
+   attached. Confirm `Filter_pdf_attachments` finds it, `Analyze_pdf_content`
+   succeeds, and the agent's reply reflects the PDF's content.
+8. Send a fourth email with a non-PDF attachment (for example, a `.docx`) and
+   confirm the workflow still answers from the subject and body alone, as if
+   no attachment were present.
+9. Review any failures in Logic App run history and in Application Insights.
 
 ## Create a Receiving Email Address
 
@@ -411,5 +462,9 @@ For example, with primary address `rafael@contoso.com` and alias
 - Storage access uses managed identity with data-plane RBAC only.
 - Foundry access uses the system-assigned managed identity with the
   `Foundry User` role, scoped to the single Foundry account.
+- PDF text extraction uses the same managed identity with the
+  `Cognitive Services User` role, scoped to the same Foundry account's Content
+  Understanding endpoint. No PDF content is persisted by the workflow beyond
+  the run instance's own execution history.
 - The only credential in the system is the delegated Outlook OAuth grant, which
   is held by the API connection resource and never leaves Azure.

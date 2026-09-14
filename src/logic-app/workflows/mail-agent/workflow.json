@@ -20,7 +20,7 @@
               "fetchOnlyWithAttachment": false,
               "folderPath": "Inbox",
               "importance": "Any",
-              "includeAttachments": false,
+              "includeAttachments": true,
               "subjectFilter": "@appsetting('MAIL_TRIGGER_PHRASE')"
             }
           },
@@ -43,9 +43,26 @@
       }
     },
     "actions": {
+      "Initialize_pdf_extracted_text": {
+        "type": "InitializeVariable",
+        "runAfter": {},
+        "inputs": {
+          "variables": [
+            {
+              "name": "pdf_extracted_text",
+              "type": "string",
+              "value": ""
+            }
+          ]
+        }
+      },
       "Check_subject_prefix": {
         "type": "If",
-        "runAfter": {},
+        "runAfter": {
+          "Initialize_pdf_extracted_text": [
+            "Succeeded"
+          ]
+        },
         "expression": {
           "and": [
             {
@@ -68,9 +85,118 @@
           "actions": {}
         },
         "actions": {
+          "Filter_pdf_attachments": {
+            "type": "Query",
+            "runAfter": {},
+            "inputs": {
+              "from": "@coalesce(triggerBody()?['attachments'], createArray())",
+              "where": "@equals(toLower(coalesce(item()?['contentType'], '')), 'application/pdf')"
+            }
+          },
+          "Check_has_pdf_attachment": {
+            "type": "If",
+            "runAfter": {
+              "Filter_pdf_attachments": [
+                "Succeeded"
+              ]
+            },
+            "expression": {
+              "greater": [
+                "@length(body('Filter_pdf_attachments'))",
+                0
+              ]
+            },
+            "else": {
+              "actions": {}
+            },
+            "actions": {
+              "Analyze_pdf_content": {
+                "type": "Http",
+                "runAfter": {},
+                "inputs": {
+                  "method": "POST",
+                  "uri": "@concat(appsetting('CONTENT_UNDERSTANDING_ENDPOINT'), '/contentunderstanding/analyzers/prebuilt-documentSearch:analyzeBinary?api-version=2025-11-01')",
+                  "headers": {
+                    "Content-Type": "application/octet-stream"
+                  },
+                  "authentication": {
+                    "type": "ManagedServiceIdentity",
+                    "audience": "https://cognitiveservices.azure.com"
+                  },
+                  "body": "@base64ToBinary(first(body('Filter_pdf_attachments'))?['contentBytes'])",
+                  "operationOptions": "DisableAsyncPattern"
+                },
+                "runtimeConfiguration": {
+                  "contentTransfer": {
+                    "transferMode": "Chunked"
+                  }
+                }
+              },
+              "Until_pdf_analysis_complete": {
+                "type": "Until",
+                "runAfter": {
+                  "Analyze_pdf_content": [
+                    "Succeeded"
+                  ]
+                },
+                "expression": "@or(equals(body('Get_pdf_analysis_result')?['status'], 'Succeeded'), equals(body('Get_pdf_analysis_result')?['status'], 'Failed'))",
+                "limit": {
+                  "count": 30,
+                  "timeout": "PT1M"
+                },
+                "actions": {
+                  "Delay_before_poll": {
+                    "type": "Wait",
+                    "runAfter": {},
+                    "inputs": {
+                      "interval": {
+                        "count": 2,
+                        "unit": "Second"
+                      }
+                    }
+                  },
+                  "Get_pdf_analysis_result": {
+                    "type": "Http",
+                    "runAfter": {
+                      "Delay_before_poll": [
+                        "Succeeded"
+                      ]
+                    },
+                    "inputs": {
+                      "method": "GET",
+                      "uri": "@outputs('Analyze_pdf_content')?['headers']?['Operation-Location']",
+                      "authentication": {
+                        "type": "ManagedServiceIdentity",
+                        "audience": "https://cognitiveservices.azure.com"
+                      }
+                    }
+                  }
+                }
+              },
+              "Set_pdf_extracted_text": {
+                "type": "SetVariable",
+                "runAfter": {
+                  "Until_pdf_analysis_complete": [
+                    "Succeeded"
+                  ]
+                },
+                "inputs": {
+                  "name": "pdf_extracted_text",
+                  "value": "@if(and(equals(body('Get_pdf_analysis_result')?['status'], 'Succeeded'), greater(length(coalesce(body('Get_pdf_analysis_result')?['result']?['contents'], createArray())), 0)), first(body('Get_pdf_analysis_result')?['result']?['contents'])?['markdown'], '')"
+                }
+              }
+            }
+          },
           "Call_Foundry_agent": {
             "type": "Http",
-            "runAfter": {},
+            "runAfter": {
+              "Check_has_pdf_attachment": [
+                "Succeeded",
+                "Skipped",
+                "Failed",
+                "TimedOut"
+              ]
+            },
             "inputs": {
               "method": "POST",
               "uri": "@concat(appsetting('FOUNDRY_PROJECT_ENDPOINT'), '/openai/v1/responses')",
@@ -86,7 +212,7 @@
                   "name": "@appsetting('FOUNDRY_AGENT_NAME')",
                   "type": "agent_reference"
                 },
-                "input": "@concat('Subject: ', coalesce(triggerBody()?['subject'], '(no subject)'), decodeUriComponent('%0A%0A'), coalesce(triggerBody()?['body'], triggerBody()?['bodyPreview'], ''))"
+                "input": "@concat('Subject: ', coalesce(triggerBody()?['subject'], '(no subject)'), decodeUriComponent('%0A%0A'), coalesce(triggerBody()?['body'], triggerBody()?['bodyPreview'], ''), if(greater(length(variables('pdf_extracted_text')), 0), concat(decodeUriComponent('%0A%0A'), 'Attached PDF content:', decodeUriComponent('%0A'), variables('pdf_extracted_text')), ''))"
               }
             },
             "runtimeConfiguration": {
